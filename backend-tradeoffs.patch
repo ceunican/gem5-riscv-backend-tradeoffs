@@ -1,0 +1,557 @@
+diff --git a/src/cpu/o3/BaseO3CPU.py b/src/cpu/o3/BaseO3CPU.py
+index 3c477c115b..abfb0de4ac 100644
+--- a/src/cpu/o3/BaseO3CPU.py
++++ b/src/cpu/o3/BaseO3CPU.py
+@@ -239,6 +239,11 @@ class BaseO3CPU(BaseCPU):
+     maxTakenPredPerCycle = Param.Unsigned(
+         1, "Max number of taken predictions per cycle"
+     )
++    steeringLessFull = Param.Bool(
++        False,
++        "Whether to steer instructions to the less full IQ when inserting "
++        "into the IQ. This is only used when there are multiple IQs.",
++    )
+ 
+ 
+ add_citation(
+diff --git a/src/cpu/o3/dyn_inst.cc b/src/cpu/o3/dyn_inst.cc
+index 0f500d8923..f76e39cb8f 100644
+--- a/src/cpu/o3/dyn_inst.cc
++++ b/src/cpu/o3/dyn_inst.cc
+@@ -344,6 +344,18 @@ DynInst::setSquashed()
+     setPinnedRegsSquashDone();
+ }
+ 
++ /** Clears this instruction as a entry the IQ. */
++IQUnit *
++DynInst::clearInIQ()
++{
++    assert(iq);
++    status.reset(IqEntry);
++    iq->remove(this);
++    IQUnit *old = iq;
++    iq = nullptr;
++    return old;
++}
++
+ Fault
+ DynInst::execute()
+ {
+diff --git a/src/cpu/o3/dyn_inst.hh b/src/cpu/o3/dyn_inst.hh
+index f0c14fb177..43bf312fed 100644
+--- a/src/cpu/o3/dyn_inst.hh
++++ b/src/cpu/o3/dyn_inst.hh
+@@ -806,14 +806,7 @@ class DynInst : public ExecContext, public RefCounted
+     }
+ 
+     /** Clears this instruction as a entry the IQ. */
+-    void
+-    clearInIQ()
+-    {
+-        assert(iq);
+-        status.reset(IqEntry);
+-        iq->remove(this);
+-        iq = nullptr;
+-    }
++    IQUnit *clearInIQ();
+ 
+     /** Returns whether or not this instruction has issued. */
+     bool isInIQ() const { return status[IqEntry]; }
+diff --git a/src/cpu/o3/iew.cc b/src/cpu/o3/iew.cc
+index d5be814468..c0d8e1ee7d 100644
+--- a/src/cpu/o3/iew.cc
++++ b/src/cpu/o3/iew.cc
+@@ -88,6 +88,7 @@ IEW::IEW(CPU *_cpu, const BaseO3CPUParams &params)
+       wbCycle(0),
+       wbWidth(params.wbWidth),
+       numThreads(params.numThreads),
++      steering_less_full(params.steeringLessFull),
+       iewStats(cpu)
+ {
+     if (dispatchWidth > MaxWidth)
+@@ -170,7 +171,8 @@ IEW::IEWStats::IEWStats(CPU *cpu)
+       ADD_STAT(dispNonSpecInsts, statistics::units::Count::get(),
+                "Number of dispatched non-speculative instructions"),
+       ADD_STAT(iqFullEvents, statistics::units::Count::get(),
+-               "Number of times the IQ has become full, causing a stall"),
++               "Number of times the current instruction cannot "
++               "be inserted into IQ, causing a stall"),
+       ADD_STAT(lsqFullEvents, statistics::units::Count::get(),
+                "Number of times the LSQ has become full, causing a stall"),
+       ADD_STAT(memOrderViolationEvents, statistics::units::Count::get(),
+@@ -1000,7 +1002,7 @@ IEW::dispatchInsts(ThreadID tid)
+             // so that commit can process them when they reach the
+             // head of commit.
+             inst->setCanCommit();
+-            instQueue.insertNonSpec(inst);
++            instQueue.insertNonSpec(inst, steering_less_full);
+             add_to_iq = false;
+ 
+             ++iewStats.dispNonSpecInsts;
+@@ -1033,7 +1035,7 @@ IEW::dispatchInsts(ThreadID tid)
+                 // head of commit.
+                 // @todo: This is somewhat specific to Alpha.
+                 inst->setCanCommit();
+-                instQueue.insertNonSpec(inst);
++                instQueue.insertNonSpec(inst, steering_less_full);
+                 add_to_iq = false;
+ 
+                 ++iewStats.dispNonSpecInsts;
+@@ -1045,7 +1047,7 @@ IEW::dispatchInsts(ThreadID tid)
+         } else if (inst->isReadBarrier() || inst->isWriteBarrier()) {
+             // Same as non-speculative stores.
+             inst->setCanCommit();
+-            instQueue.insertBarrier(inst);
++            instQueue.insertBarrier(inst, steering_less_full);
+             add_to_iq = false;
+         } else if (inst->isNop()) {
+             DPRINTF(IEW, "[tid:%i] Issue: Nop instruction encountered, "
+@@ -1073,7 +1075,7 @@ IEW::dispatchInsts(ThreadID tid)
+             inst->setCanCommit();
+ 
+             // Specifically insert it as nonspeculative.
+-            instQueue.insertNonSpec(inst);
++            instQueue.insertNonSpec(inst, steering_less_full);
+ 
+             ++iewStats.dispNonSpecInsts;
+ 
+@@ -1083,7 +1085,7 @@ IEW::dispatchInsts(ThreadID tid)
+         // If the instruction queue is not full, then add the
+         // instruction.
+         if (add_to_iq) {
+-            instQueue.insert(inst);
++            instQueue.insert(inst, steering_less_full);
+         }
+ 
+         insts_to_dispatch.pop();
+diff --git a/src/cpu/o3/iew.hh b/src/cpu/o3/iew.hh
+index c62a3dc835..2cc5120082 100644
+--- a/src/cpu/o3/iew.hh
++++ b/src/cpu/o3/iew.hh
+@@ -126,6 +126,9 @@ class IEW
+     /** To probe when instruction execution is complete. */
+     ProbePointArg<DynInstPtr> *ppToCommit;
+ 
++    /** Steering policy for selecting the least-full IQ. */
++    bool steering_less_full;
++
+   public:
+     /** Constructs a IEW with the given parameters. */
+     IEW(CPU *_cpu, const BaseO3CPUParams &params);
+diff --git a/src/cpu/o3/inst_queue.cc b/src/cpu/o3/inst_queue.cc
+index dd26eca82f..580733661b 100644
+--- a/src/cpu/o3/inst_queue.cc
++++ b/src/cpu/o3/inst_queue.cc
+@@ -228,7 +228,7 @@ InstructionQueue::InstructionQueue(CPU *cpu_ptr, IEW *iew_ptr,
+       numThreads(params.numThreads),
+       totalWidth(params.issueWidth),
+       commitToIEWDelay(params.commitToIEWDelay),
+-      iqStats(cpu, totalWidth),
++      iqStats(cpu, totalWidth, iqs.size()),
+       iqIOStats(cpu)
+ {
+     const auto &reg_classes = params.isa[0]->regClasses();
+@@ -255,6 +255,10 @@ InstructionQueue::InstructionQueue(CPU *cpu_ptr, IEW *iew_ptr,
+         memDepUnit[tid].setIQ(this);
+     }
+ 
++    for (unsigned i = 0; i < iqs.size(); ++i) {
++        iqs[i]->setId(i);
++    }
++
+     resetState();
+ }
+ 
+@@ -273,7 +277,8 @@ InstructionQueue::name() const
+     return cpu->name() + ".iq";
+ }
+ 
+-InstructionQueue::IQStats::IQStats(CPU *cpu, const unsigned &total_width)
++InstructionQueue::IQStats::IQStats(CPU *cpu, const unsigned &total_width,
++                                   size_t num_iq_units)
+     : statistics::Group(cpu),
+       ADD_STAT(instsAdded, statistics::units::Count::get(),
+                "Number of instructions added to the IQ (excludes non-spec)"),
+@@ -316,7 +321,22 @@ InstructionQueue::IQStats::IQStats(CPU *cpu, const unsigned &total_width)
+       ADD_STAT(fuBusyRate,
+                statistics::units::Rate<statistics::units::Count,
+                                        statistics::units::Count>::get(),
+-               "FU busy rate (busy events/executed inst)")
++               "FU busy rate (busy events/executed inst)"),
++      ADD_STAT(iqAvgOccupancy, statistics::units::Ratio::get(),
++                "Average IQ Occupancy (UsedSlots/TotalSlots)"),
++      ADD_STAT(instsAddedIQUnit, statistics::units::Count::get(),
++               "Number of instructions added to each IQ unit"),
++      ADD_STAT(nonSpecInstsAddedIQUnit, statistics::units::Count::get(),
++               "Number of non-spec instructions added to each IQ unit"),
++      ADD_STAT(iqUnitBecameFull, statistics::units::Count::get(),
++               "Number of times IQ unit became full after an insertion"),
++      ADD_STAT(iqUnitBecameEmpty, statistics::units::Count::get(),
++               "Number of times IQ unit became empty after a removal"),
++      ADD_STAT(iqUnitFull, statistics::units::Count::get(),
++               "Number of times candidate IQ Unit was full when trying "
++               "to insert"),
++      ADD_STAT(iqUnitAvgOccupancy, statistics::units::Ratio::get(),
++               "Average occupancy for each IQ unit (UsedSlots/TotalSlots)")
+ {
+     instsAdded
+         .prereq(instsAdded);
+@@ -420,6 +440,52 @@ InstructionQueue::IQStats::IQStats(CPU *cpu, const unsigned &total_width)
+         .flags(statistics::total)
+         ;
+     fuBusyRate = fuBusy / instsIssued;
++
++    iqAvgOccupancy.precision(2);
++
++    instsAddedIQUnit
++        .init(num_iq_units)
++        .flags(statistics::total | statistics::nozero | statistics::pdf |
++               statistics::dist)
++        ;
++
++    nonSpecInstsAddedIQUnit
++        .init(num_iq_units)
++        .flags(statistics::total | statistics::nozero | statistics::pdf |
++               statistics::dist)
++        ;
++
++    iqUnitBecameFull
++        .init(num_iq_units)
++        .flags(statistics::total | statistics::pdf | statistics::dist)
++        ;
++
++    iqUnitBecameEmpty
++        .init(num_iq_units)
++        .flags(statistics::total | statistics::pdf | statistics::dist)
++        ;
++
++    iqUnitFull
++        .init(num_iq_units)
++        .flags(statistics::total | statistics::pdf | statistics::dist)
++        ;
++
++    iqUnitAvgOccupancy
++        .init(num_iq_units)
++        .flags(statistics::pdf | statistics::dist)
++        ;
++
++    for (int i=0; i < num_iq_units; ++i) {
++        std::stringstream subname;
++        subname << "IQ_Unit_" << i;
++        instsAddedIQUnit.subname(i, subname.str());
++        nonSpecInstsAddedIQUnit.subname(i, subname.str());
++        iqUnitBecameFull.subname(i, subname.str());
++        iqUnitBecameEmpty.subname(i, subname.str());
++        iqUnitFull.subname(i, subname.str());
++        iqUnitAvgOccupancy.subname(i, subname.str());
++        iqUnitAvgOccupancy.precision(2);
++    }
+ }
+ 
+ InstructionQueue::IQIOStats::IQIOStats(statistics::Group *parent)
+@@ -577,7 +643,16 @@ InstructionQueue::takeOverFrom()
+ }
+ 
+ unsigned
+-InstructionQueue::numFreeEntries()
++InstructionQueue::numEntries() const
++{
++    unsigned num_entries = 0;
++    for (auto iq : iqs) {
++        num_entries += iq->numEntries();
++    }
++    return num_entries;
++}
++unsigned
++InstructionQueue::numFreeEntries() const
+ {
+     unsigned free_entries = 0;
+     for (auto iq : iqs) {
+@@ -653,12 +728,43 @@ InstructionQueue::hasReadyInsts()
+ }
+ 
+ IQUnit *
+-InstructionQueue::findIQ(const DynInstPtr &inst)
++InstructionQueue::findIQ(const DynInstPtr &inst, bool steering_less_full)
+ {
++    const OpClass op_class = inst->opClass();
++
++    if (steering_less_full) {
++        // Find the IQ with the most free entries
++        IQUnit *best_iq = nullptr;
++        unsigned max_free_entries = 0;
++        for (auto iq : iqs) {
++            unsigned iq_free_entries = iq->numFreeEntries(inst);
++            const bool capable =
++                op_class == No_OpClass || iq->fuPool()->isCapable(op_class);
++
++            if (capable && iq_free_entries == 0) {
++                ++iqStats.iqUnitFull[iq->getId()];
++            }
++
++            if (iq_free_entries > max_free_entries) {
++                best_iq = iq;
++                max_free_entries = iq_free_entries;
++            }
++        }
++        return best_iq;
++    }
++
+     for (auto iq : iqs) {
++        unsigned iq_free_entries = iq->numFreeEntries(inst);
++        const bool capable =
++            op_class == No_OpClass || iq->fuPool()->isCapable(op_class);
++
++        if (capable && iq_free_entries == 0) {
++            ++iqStats.iqUnitFull[iq->getId()];
++        }
++
+         // If the IQ can store the selected instruction,
+         // return the IQ as valid
+-        if (iq->numFreeEntries(inst) > 0) {
++        if (iq_free_entries > 0) {
+             return iq;
+         }
+     }
+@@ -666,7 +772,7 @@ InstructionQueue::findIQ(const DynInstPtr &inst)
+ }
+ 
+ void
+-InstructionQueue::insert(const DynInstPtr &new_inst)
++InstructionQueue::insert(const DynInstPtr &new_inst, bool steering_less_full)
+ {
+     if (new_inst->isFloating()) {
+         iqIOStats.fpInstQueueWrites++;
+@@ -683,7 +789,7 @@ InstructionQueue::insert(const DynInstPtr &new_inst)
+ 
+     instList[new_inst->threadNumber].push_back(new_inst);
+ 
+-    auto iq = findIQ(new_inst);
++    auto iq = findIQ(new_inst, steering_less_full);
+     assert(iq);
+     iq->insert(new_inst);
+ 
+@@ -701,11 +807,17 @@ InstructionQueue::insert(const DynInstPtr &new_inst)
+         addIfReady(new_inst);
+     }
+ 
++    // Update stats
+     ++iqStats.instsAdded;
++    ++iqStats.instsAddedIQUnit[iq->getId()];
++    updateIQOccupancy(iq);
++    if (iq->numFreeEntries(new_inst) == 0) {
++        ++iqStats.iqUnitBecameFull[iq->getId()];
++    }
+ }
+ 
+ void
+-InstructionQueue::insertNonSpec(const DynInstPtr &new_inst)
++InstructionQueue::insertNonSpec(const DynInstPtr &new_inst, bool steering_less_full)
+ {
+     // @todo: Clean up this code; can do it by setting inst as unable
+     // to issue, then calling normal insert on the inst.
+@@ -727,7 +839,7 @@ InstructionQueue::insertNonSpec(const DynInstPtr &new_inst)
+ 
+     instList[new_inst->threadNumber].push_back(new_inst);
+ 
+-    auto iq = findIQ(new_inst);
++    auto iq = findIQ(new_inst, steering_less_full);
+     assert(iq);
+     iq->insert(new_inst);
+ 
+@@ -742,14 +854,16 @@ InstructionQueue::insertNonSpec(const DynInstPtr &new_inst)
+     }
+ 
+     ++iqStats.nonSpecInstsAdded;
++    ++iqStats.nonSpecInstsAddedIQUnit[iq->getId()];
++    updateIQOccupancy(iq);
+ }
+ 
+ void
+-InstructionQueue::insertBarrier(const DynInstPtr &barr_inst)
++InstructionQueue::insertBarrier(const DynInstPtr &barr_inst, bool steering_less_full)
+ {
+     memDepUnit[barr_inst->threadNumber].insertBarrier(barr_inst);
+ 
+-    insertNonSpec(barr_inst);
++    insertNonSpec(barr_inst, steering_less_full);
+ }
+ 
+ DynInstPtr
+@@ -999,7 +1113,9 @@ InstructionQueue::scheduleReadyInsts()
+             if (!issuing_inst->isMemRef()) {
+                 // Memory instructions can not be freed from the IQ until they
+                 // complete.
+-                issuing_inst->clearInIQ();
++                IQUnit *iq_freed = issuing_inst->clearInIQ();
++                updateIQOccupancy(iq_freed);
++
+             } else {
+                 memDepUnit[tid].issue(issuing_inst);
+             }
+@@ -1100,7 +1216,8 @@ InstructionQueue::wakeDependents(const DynInstPtr &completed_inst)
+         DPRINTF(IQ, "Completing mem instruction PC: %s [sn:%llu]\n",
+             completed_inst->pcState(), completed_inst->seqNum);
+ 
+-        completed_inst->clearInIQ();
++        IQUnit *iq = completed_inst->clearInIQ();
++        updateIQOccupancy(iq);
+         completed_inst->memOpDone(true);
+     } else if (completed_inst->isReadBarrier() ||
+                completed_inst->isWriteBarrier()) {
+@@ -1416,7 +1533,8 @@ InstructionQueue::doSquash(ThreadID tid)
+             // inst will flow through the rest of the pipeline.
+             squashed_inst->setIssued();
+             squashed_inst->setCanCommit();
+-            squashed_inst->clearInIQ();
++            IQUnit *iq = squashed_inst->clearInIQ();
++            updateIQOccupancy(iq);
+         }
+ 
+         // IQ clears out the heads of the dependency graph only when
+@@ -1699,5 +1817,15 @@ InstructionQueue::dumpInsts()
+     }
+ }
+ 
++void
++InstructionQueue::updateIQOccupancy(IQUnit *iq)
++{
++    iqStats.iqAvgOccupancy = InstQueueOccupancy();
++    iqStats.iqUnitAvgOccupancy[iq->getId()] = iq->IQUnitOccupancy();
++    if (iq->numFreeEntries() == iq->numEntries()) {
++       iqStats.iqUnitBecameEmpty[iq->getId()]++;
++    }
++}
++
+ } // namespace o3
+ } // namespace gem5
+diff --git a/src/cpu/o3/inst_queue.hh b/src/cpu/o3/inst_queue.hh
+index 844521caf9..4623700258 100644
+--- a/src/cpu/o3/inst_queue.hh
++++ b/src/cpu/o3/inst_queue.hh
+@@ -132,6 +132,23 @@ class IQUnit : public SimObject
+         return _fuPool;
+     }
+ 
++    void setId(unsigned id)
++    {
++        _id = id;
++    }
++
++    unsigned getId() const
++    {
++        return _id;
++    }
++
++    double
++    IQUnitOccupancy() const
++    {
++        return static_cast<double>(numEntries()-numFreeEntries()) /
++               static_cast<double>(numEntries());
++    }
++
+   private:
+     /** IQ sharing policy for SMT. */
+     SMTQueuePolicy iqPolicy;
+@@ -156,6 +173,9 @@ class IQUnit : public SimObject
+ 
+     /** Function unit pool. */
+     FUPool *_fuPool;
++
++    /** ID for statistics purposes. */
++    unsigned _id;
+ };
+ 
+ /**
+@@ -243,8 +263,11 @@ class InstructionQueue
+     /** Takes over execution from another CPU's thread. */
+     void takeOverFrom();
+ 
++    /** Returns total number of entries. */
++    unsigned numEntries() const;
++
+     /** Returns total number of free entries. */
+-    unsigned numFreeEntries();
++    unsigned numFreeEntries() const;
+ 
+     /** Returns number of free entries for a thread. */
+     unsigned numFreeEntries(ThreadID tid);
+@@ -271,18 +294,18 @@ class InstructionQueue
+     bool hasReadyInsts();
+ 
+     /** Find a compatible IQ (e.g. to insert the instruction) */
+-    IQUnit *findIQ(const DynInstPtr &inst);
++    IQUnit *findIQ(const DynInstPtr &inst, bool steering_less_full);
+ 
+     /** Inserts a new instruction into the IQ. */
+-    void insert(const DynInstPtr &new_inst);
++    void insert(const DynInstPtr &new_inst, bool steering_less_full);
+ 
+     /** Inserts a new, non-speculative instruction into the IQ. */
+-    void insertNonSpec(const DynInstPtr &new_inst);
++    void insertNonSpec(const DynInstPtr &new_inst, bool steering_less_full);
+ 
+     /** Inserts a memory or write barrier into the IQ to make sure
+      *  loads and stores are ordered properly.
+      */
+-    void insertBarrier(const DynInstPtr &barr_inst);
++    void insertBarrier(const DynInstPtr &barr_inst, bool steering_less_full);
+ 
+     /** Returns the oldest scheduled instruction, and removes it from
+      * the list of instructions waiting to execute.
+@@ -373,6 +396,15 @@ class InstructionQueue
+     /** Debug function to print all instructions. */
+     void printInsts();
+ 
++    /** Returns the occupancy of a given queue as a ratio of used slots
++    to total slots. */
++    double
++    InstQueueOccupancy() const
++    {
++        return static_cast<double>(numEntries()-numFreeEntries()) /
++               static_cast<double>(numEntries());
++    }
++
+   private:
+     /** Does the actual squashing. */
+     void doSquash(ThreadID tid);
+@@ -552,9 +584,12 @@ class InstructionQueue
+      */
+     void dumpInsts();
+ 
++    /** IQ occupancy helper */
++    void updateIQOccupancy(IQUnit *iq);
++
+     struct IQStats : public statistics::Group
+     {
+-        IQStats(CPU *cpu, const unsigned &total_width);
++        IQStats(CPU *cpu, const unsigned &total_width, size_t num_iq_units);
+         /** Stat for number of instructions added. */
+         statistics::Scalar instsAdded;
+         /** Stat for number of non-speculative instructions added. */
+@@ -613,6 +648,25 @@ class InstructionQueue
+         statistics::Vector fuBusy;
+         /** Number of times the FU was busy per instruction issued. */
+         statistics::Formula fuBusyRate;
++
++        /**IQ occupancy */
++        statistics::Average iqAvgOccupancy;
++
++        // Stats for distributed IQ
++        /** Stat for number of instructions added per part. */
++        statistics::Vector instsAddedIQUnit;
++        /** Stat for number of nonSpec instructions added per part. */
++        statistics::Vector nonSpecInstsAddedIQUnit;
++        /** Stat for number of times each part of the IQ
++         * became full after an insertion. */
++        statistics::Vector iqUnitBecameFull;
++        /** Stat for number of times each part of the IQ became empty. */
++        statistics::Vector iqUnitBecameEmpty;
++        /** Stat for number of times candidate IQ Unit was full
++        when trying to insert for that op.  */
++        statistics::Vector iqUnitFull;
++        /** Occupancy for each part of the IQ. */
++        statistics::AverageVector iqUnitAvgOccupancy;
+     } iqStats;
+ 
+    public:
